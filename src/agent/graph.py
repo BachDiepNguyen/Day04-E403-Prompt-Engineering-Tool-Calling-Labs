@@ -463,9 +463,14 @@ def _saved_answer(save_output: dict[str, Any]) -> str:
     discount = saved["discount"]
     rate_percent = int(pricing["discount_rate"] * 100)
     final_total = f"{pricing['final_total']:,}".replace(",", ".")
+    customer = saved["customer"]
+    item_summary = "; ".join(f"{item['quantity']} {item['name']}" for item in saved["items"])
     return (
-        f"Đã lưu đơn {saved['order_id']} với khuyến mãi {discount['campaign_code']} "
-        f"({rate_percent}%), tổng thanh toán {final_total} VND. "
+        f"Đã xác thực catalog và lưu đơn {saved['order_id']} cho {customer['name']}, "
+        f"liên hệ {customer['phone']} / {customer['email']}, giao đến {customer['shipping_address']}. "
+        f"Sản phẩm: {item_summary}. "
+        f"Khuyến mãi hệ thống {discount['campaign_code']} ({rate_percent}%), "
+        f"tổng thanh toán {final_total} VND. "
         f"File lưu tại {saved['save_path']}."
     )
 
