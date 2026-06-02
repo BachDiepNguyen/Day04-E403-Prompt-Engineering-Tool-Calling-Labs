@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,7 @@ Language and tone:
 Clarification gate:
 - Before any tool call, verify that the user provided all required fields:
   customer name, phone number, email, shipping address, and at least one item with quantity.
+- Treat item quantity as present when the user lists or quotes product names without a number; in that case use quantity 1.
 - If any required field is missing, ask only for the missing fields and stop without tools.
 
 Safety and policy gate:
@@ -61,7 +62,17 @@ Stock and validation:
 
 Final answer:
 - For saved orders, mention the saved order ID, campaign/discount, final total, and saved path.
+- Also briefly list ordered item names and quantities so the customer can verify the saved order.
 - For clarification or refusal, do not mention internal implementation details.
+
+Operational details:
+- When a valid order has multiple requested products, call get_product_details once with all selected product IDs.
+- Use the exact product IDs returned by list_products and get_product_details.
+- If the user quotes or lists item names without quantities, do not ask for clarification; treat each item as quantity 1.
+- Use the customer email as get_discount.seed_hint; use customer_tier="standard" unless the user clearly says VIP.
+- Use the detail_token from get_product_details for calculate_order_totals and save_order.
+- Use the discount_rate and campaign_code returned by get_discount; do not create your own discount.
+- If calculate_order_totals returns status "error", do not call save_order.
 """.strip()
 
 
@@ -165,116 +176,41 @@ def run_agent(
     output_dir: Path | None = None,
     today: str | None = None,
 ) -> AgentResult:
-    store = OrderDataStore(data_dir or DEFAULT_DATA_DIR, output_dir or DEFAULT_OUTPUT_DIR, today=today)
-
-    guardrail_answer = _guardrail_answer(query)
-    if guardrail_answer:
-        return AgentResult(
-            query=query,
-            final_answer=guardrail_answer,
-            provider=provider,
-            model_name=model_name,
-        )
-
-    parsed = _parse_order_request(query, store)
-    missing = _missing_fields(parsed)
-    if missing:
-        return AgentResult(
-            query=query,
-            final_answer=_clarification_answer(missing),
-            provider=provider,
-            model_name=model_name,
-        )
-
-    tool_calls: list[ToolCallRecord] = []
-    product_names = " ".join(store.product_index[item.product_id].name for item in parsed["items"])
-
-    list_args = {"query": product_names, "in_stock_only": True, "limit": 20}
-    list_output = store.list_products(**list_args)
-    _record_tool(tool_calls, "list_products", list_args, list_output)
-
-    product_ids = [item.product_id for item in parsed["items"]]
-    detail_args = {"product_ids": product_ids}
-    detail_output = store.get_product_details(product_ids)
-    _record_tool(tool_calls, "get_product_details", detail_args, detail_output)
-
-    stock_errors = _stock_errors(parsed["items"], store)
-    if stock_errors:
-        return AgentResult(
-            query=query,
-            final_answer="Không thể lưu đơn hàng vì " + "; ".join(stock_errors) + ".",
-            tool_calls=tool_calls,
-            provider=provider,
-            model_name=model_name,
-        )
-
-    customer_tier = "vip" if re.search(r"\bvip\b", query, flags=re.IGNORECASE) else "standard"
-    discount_args = {"seed_hint": parsed["customer_email"], "customer_tier": customer_tier}
-    discount_output = store.get_discount(**discount_args)
-    _record_tool(tool_calls, "get_discount", discount_args, discount_output)
-
-    detail_token = detail_output["detail_token"]
-    discount_rate = discount_output["discount_rate"]
-    item_args = [{"product_id": item.product_id, "quantity": item.quantity} for item in parsed["items"]]
-
-    totals_args = {
-        "items": item_args,
-        "detail_token": detail_token,
-        "discount_rate": discount_rate,
-    }
-    totals_output = store.calculate_order_totals(
-        items=parsed["items"],
-        detail_token=detail_token,
-        discount_rate=discount_rate,
+    agent = build_agent(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        provider=provider,
+        model_name=model_name,
+        today=today,
     )
-    _record_tool(tool_calls, "calculate_order_totals", totals_args, totals_output)
-
-    if totals_output["status"] != "ok":
-        return AgentResult(
-            query=query,
-            final_answer="Không thể lưu đơn hàng vì " + "; ".join(totals_output.get("errors", [])) + ".",
-            tool_calls=tool_calls,
-            provider=provider,
-            model_name=model_name,
-        )
-
-    save_args = {
-        "customer_name": parsed["customer_name"],
-        "customer_phone": parsed["customer_phone"],
-        "customer_email": parsed["customer_email"],
-        "shipping_address": parsed["shipping_address"],
-        "items": item_args,
-        "detail_token": detail_token,
-        "discount_rate": discount_rate,
-        "campaign_code": discount_output["campaign_code"],
-        "customer_tier": customer_tier,
-        "notes": "",
-    }
-    save_output = store.save_order(
-        customer_name=parsed["customer_name"],
-        customer_phone=parsed["customer_phone"],
-        customer_email=parsed["customer_email"],
-        shipping_address=parsed["shipping_address"],
-        items=parsed["items"],
-        detail_token=detail_token,
-        discount_rate=discount_rate,
-        campaign_code=discount_output["campaign_code"],
-        customer_tier=customer_tier,
-        notes="",
-    )
-    _record_tool(tool_calls, "save_order", save_args, save_output)
-
+    response = _invoke_agent_with_retry(agent, query)
+    messages = response["messages"] if isinstance(response, dict) else response
+    tool_calls = extract_tool_calls(messages)
     saved_order, saved_path = extract_saved_order(tool_calls)
-    final_answer = _saved_answer(save_output)
     return AgentResult(
         query=query,
-        final_answer=final_answer,
+        final_answer=extract_final_answer(messages),
         tool_calls=tool_calls,
         provider=provider,
         model_name=model_name,
         saved_order=saved_order,
         saved_order_path=saved_path,
     )
+
+
+def _invoke_agent_with_retry(agent, query: str):
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            return agent.invoke({"messages": [{"role": "user", "content": query}]})
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc).lower()
+            if "503" not in error_text and "unavailable" not in error_text and "429" not in error_text:
+                raise
+            if attempt < 2:
+                time.sleep(8 * (attempt + 1))
+    raise last_error  # type: ignore[misc]
 
 
 def extract_final_answer(messages) -> str:
@@ -332,153 +268,3 @@ def _coerce_order_line(raw: Any) -> OrderLineInput:
     if isinstance(raw, dict):
         return OrderLineInput(product_id=str(raw["product_id"]), quantity=int(raw["quantity"]))
     return OrderLineInput.model_validate(raw)
-
-
-def _record_tool(tool_calls: list[ToolCallRecord], name: str, args: dict[str, Any], output: Any) -> None:
-    normalized_args = json.loads(json.dumps(args, ensure_ascii=False, default=_json_default))
-    output_text = json.dumps(output, ensure_ascii=False, default=_json_default)
-    tool_calls.append(ToolCallRecord(name=name, args=normalized_args, output=output_text))
-
-
-def _json_default(value: Any) -> Any:
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
-
-def _guardrail_answer(query: str) -> str:
-    normalized = _normalize_for_rules(query)
-    unsafe_markers = [
-        "hoa don gia",
-        "fake invoice",
-        "gia mao hoa don",
-        "giam gia 90",
-        "ep giam gia",
-        "tu ep giam gia",
-        "manual discount",
-        "bo qua ton kho",
-        "bypass stock",
-        "ignore stock",
-        "bo qua policy",
-        "ignore policy",
-        "khong can theo catalog",
-        "ignore catalog",
-    ]
-    if any(marker in normalized for marker in unsafe_markers):
-        return (
-            "Không thể tạo hóa đơn giả, tự ép khuyến mãi hoặc bỏ qua tồn kho/catalog. "
-            "Tôi chỉ có thể tạo đơn hợp lệ theo sản phẩm, tồn kho và khuyến mãi từ hệ thống."
-        )
-    return ""
-
-
-def _parse_order_request(query: str, store: OrderDataStore) -> dict[str, Any]:
-    email_match = re.search(r"[\w.+-]+@[\w.-]+\.\w+", query)
-    phone_match = re.search(r"\b0\d{9}\b", query)
-    items = _parse_items(query, store)
-    return {
-        "customer_name": _extract_customer_name(query),
-        "customer_phone": phone_match.group(0) if phone_match else "",
-        "customer_email": email_match.group(0) if email_match else "",
-        "shipping_address": _extract_shipping_address(query),
-        "items": items,
-    }
-
-
-def _parse_items(query: str, store: OrderDataStore) -> list[OrderLineInput]:
-    matches: list[tuple[int, OrderLineInput]] = []
-    lowered = query.lower()
-    for product in store.products:
-        index = lowered.find(product.name.lower())
-        if index == -1:
-            continue
-        quantity = _quantity_before(query[:index])
-        matches.append((index, OrderLineInput(product_id=product.product_id, quantity=quantity)))
-    matches.sort(key=lambda item: item[0])
-    return [item for _, item in matches]
-
-
-def _quantity_before(prefix: str) -> int:
-    cleaned = prefix.rstrip()
-    match = re.search(r"(?:^|[\s,;:])(\d+)\s*(?:x\s*)?$", cleaned, flags=re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-    return 1
-
-
-def _extract_customer_name(query: str) -> str:
-    patterns = [
-        r"\bcho\s+(.+?)(?=,\s*(?:số điện thoại|email|địa chỉ|giao|phone)|\.\s*(?:ship to|email|phone)\b)",
-        r"\bfor\s+(.+?)(?=,\s*(?:phone|email|ship)|\.)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, query, flags=re.IGNORECASE)
-        if match:
-            name = match.group(1).strip(" .,:;")
-            name = re.sub(r"^(?:chị|anh|bạn)\s+", "", name, flags=re.IGNORECASE)
-            return name
-    return ""
-
-
-def _extract_shipping_address(query: str) -> str:
-    patterns = [
-        r"(?:giao(?: hàng)?\s+(?:đến|tới|về)|địa chỉ giao hàng|ship to)\s+(.+?)(?=(?:\.\s*(?:Tôi|Mình|Chọn|Chốt|Phone|Email)\b|,\s*(?:số điện thoại|phone)\b|$))",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, query, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).strip(" .,:;")
-    return ""
-
-
-def _missing_fields(parsed: dict[str, Any]) -> list[str]:
-    fields = [
-        ("customer_name", "tên khách hàng"),
-        ("customer_phone", "số điện thoại"),
-        ("customer_email", "email"),
-        ("shipping_address", "địa chỉ giao hàng"),
-    ]
-    missing = [label for key, label in fields if not parsed.get(key)]
-    if not parsed.get("items"):
-        missing.append("sản phẩm và số lượng")
-    return missing
-
-
-def _clarification_answer(missing: list[str]) -> str:
-    return "Tôi cần thêm " + ", ".join(missing) + " trước khi tạo đơn hàng."
-
-
-def _stock_errors(items: list[OrderLineInput], store: OrderDataStore) -> list[str]:
-    errors: list[str] = []
-    for item in items:
-        product = store.product_index.get(item.product_id)
-        if product and item.quantity > product.stock:
-            errors.append(f"{product.name} chỉ còn {product.stock}, yêu cầu {item.quantity}")
-    return errors
-
-
-def _saved_answer(save_output: dict[str, Any]) -> str:
-    saved = save_output["saved_order"]
-    pricing = saved["pricing"]
-    discount = saved["discount"]
-    rate_percent = int(pricing["discount_rate"] * 100)
-    final_total = f"{pricing['final_total']:,}".replace(",", ".")
-    customer = saved["customer"]
-    item_summary = "; ".join(f"{item['quantity']} {item['name']}" for item in saved["items"])
-    return (
-        f"Đã xác thực catalog và lưu đơn {saved['order_id']} cho {customer['name']}, "
-        f"liên hệ {customer['phone']} / {customer['email']}, giao đến {customer['shipping_address']}. "
-        f"Sản phẩm: {item_summary}. "
-        f"Khuyến mãi hệ thống {discount['campaign_code']} ({rate_percent}%), "
-        f"tổng thanh toán {final_total} VND. "
-        f"File lưu tại {saved['save_path']}."
-    )
-
-
-def _normalize_for_rules(text: str) -> str:
-    import unicodedata
-
-    decomposed = unicodedata.normalize("NFKD", text)
-    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    compact = re.sub(r"[^a-zA-Z0-9]+", " ", stripped.lower())
-    return re.sub(r"\s+", " ", compact).strip()
